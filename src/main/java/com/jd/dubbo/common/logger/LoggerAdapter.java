@@ -11,7 +11,7 @@ import java.io.File;
  * @date 2016/1/21 19:58
  */
 @SPI
-public interface LoggerAdaptor {
+public interface LoggerAdapter {
 
     Logger getLogger(Class<?> key);
 
