@@ -8,6 +8,10 @@ import com.sun.xml.internal.ws.util.StringUtils;
 
 import javax.xml.ws.Holder;
 import java.awt.dnd.InvalidDnDOperationException;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -402,13 +406,220 @@ public class ExtensionLoader<T> {
             }
             return instance;
         }catch (Throwable t) {
-            throw new IllegalStateException("Extension in")
+            throw new IllegalStateException("Extension instance(name:" + name + ", class: " +
+                    type + ") could not be instanced : " + t.getMessage(), t);
         }
+    }
 
-        return null;
+    private T injectExtension(T instance) {
+        try {
+            if (objectFactory != null) {
+                for(Method method : instance.getClass().getMethods()) {
+                    if (method.getName().startsWith("set")
+                            && method.getParameterTypes().length == 1
+                            && Modifier.isPublic(method.getModifiers())) {
+                        Class<?> pt = method.getParameterTypes()[0];
+                        try {
+                            String property = method.getName().length() > 3 ? method.getName().substring(3,4).toString().toLowerCase() + method.getName().substring(4) : "";
+                            Object object = objectFactory.getExtension(pt, property);
+                            if (object != null) {
+                                method.invoke(instance, object);
+                            }
+                        }catch (Exception e) {
+                            logger.error("fail to inject via method " + method.getName()
+                            + " of interface " + type.getName() + ": " + e.getMessage(), e);
+                        }
+
+                    }
+
+                }
+            }
+        }catch (Exception e) {
+            logger.error(e.getMessage(), e);
+        }
+        return instance;
     }
 
 
+    private Class<?> getExtensionClass(String name) {
+        if (type == null) {
+            throw new IllegalArgumentException("Extension type == null");
+        }
+        if (name == null)
+            throw new IllegalArgumentException("Extension name == null");
+        Class<?> clazz = getExtensionClass().get(name);
+        if (clazz == null)
+            throw new IllegalArgumentException("No such extension \"" + name + "\" for " + type.getName() + "!");
+        return clazz;
+    }
+
+    private Map<String, Class<?>> getExtensionClasses() {
+        Map<String, Class<?>> classes = cachedClasses.get();
+        if (classes == null) {
+            synchronized (cachedClasses) {
+                classes = cachedClasses.get();
+                if (classes == null) {
+                    classes = loadExtensionClasses();
+                    cachedClasses.set(classes);
+                }
+            }
+        }
+        return classes;
+    }
+
+    /**
+     * 此方法已经getExtension方法同步过
+     * @return
+     */
+    private Map<String, Class<?>> loadExtensionClasses() {
+        final SPI defaultAnnotation = type.getAnnotation(SPI.class);
+        if (defaultAnnotation != null) {
+            String value = defaultAnnotation.value();
+            if (value != null && (value = value.trim()).length() > 0) {
+                String[] names = NAME_SEPARATOR.split(value);
+                if (names.length > 1) {
+                    throw new IllegalArgumentException("more than 1 default extension name on extension " + type.getName()
+                    + ": " + Arrays.toString(names));
+                }
+                if (names.length == 1)
+                    cachedDefaultName = names[0];
+            }
+        }
+
+        Map<String, Class<?>> extensionClasses = new HashMap<String, Class<?>>;
+        loadFile(extensionClasses, DUBBO_INTERNAL_DIRECTORY);
+        loadFile(extensionClasses, DUBBO_DIRECTORY);
+        loadFile(extensionClasses, SEVERVICES_DIRACTORY);
+        return extensionClasses;
+    }
+
+    private void loadFile(Map<String, Class<?>> extensionClasses, String dir) {
+        String fileName = dir + type.getName();
+        try {
+            Enumeration<java.net.URL> urls;
+            ClassLoader classLoader = findClassLoader();
+            if (classLoader != null) {
+                urls = classLoader.getResources(fileName);
+            } else {
+                urls = ClassLoader.getSystemResources(fileName);
+            }
+            if (urls != null) {
+                while (urls.hasMoreElements()) {
+                    java.net.URL url = urls.nextElement();
+                    try {
+                        BufferedReader reader = new BufferedReader(new InputStreamReader(url.openStream(), "utf-8"));
+                        try {
+                            String line = null;
+                            while ((line = reader.readLine()) != null) {
+                                final int ci = line.indexOf('#');
+                                if (ci >= 0) line = line.substring(0, ci);
+                                line = line.trim();
+                                if (line.length() > 0) {
+                                    try {
+                                        String name = null;
+                                        int i = line.indexOf('=');
+                                        if (i > 0) {
+                                            name = line.substring(0, i).trim();
+                                            line = line.substring(i + 1).trim();
+                                        }
+                                        if (line.length() > 0) {
+                                            Class<?> clazz = Class.forName(line, true, classLoader);
+                                            if (! type.isAssignableFrom(clazz)) {
+                                                throw new IllegalStateException("Error when load extension class(interface: " +
+                                                        type + ", class line: " + clazz.getName() + "), class "
+                                                        + clazz.getName() + "is not subtype of interface.");
+                                            }
+                                            if (clazz.isAnnotationPresent(Adaptive.class)) {
+                                                if(cachedAdaptiveClass == null) {
+                                                    cachedAdaptiveClass = clazz;
+                                                } else if (! cachedAdaptiveClass.equals(clazz)) {
+                                                    throw new IllegalStateException("More than 1 adaptive class found: "
+                                                            + cachedAdaptiveClass.getClass().getName()
+                                                            + ", " + clazz.getClass().getName());
+                                                }
+                                            } else {
+                                                try {
+                                                    clazz.getConstructor(type);
+                                                    Set<Class<?>> wrappers = cachedWrapperClasses;
+                                                    if (wrappers == null) {
+                                                        cachedWrapperClasses = new ConcurrentHashSet<Class<?>>();
+                                                        wrappers = cachedWrapperClasses;
+                                                    }
+                                                    wrappers.add(clazz);
+                                                } catch (NoSuchMethodException e) {
+                                                    clazz.getConstructor();
+                                                    if (name == null || name.length() == 0) {
+                                                        name = findAnnotationName(clazz);
+                                                        if (name == null || name.length() == 0) {
+                                                            if (clazz.getSimpleName().length() > type.getSimpleName().length()
+                                                                    && clazz.getSimpleName().endsWith(type.getSimpleName())) {
+                                                                name = clazz.getSimpleName().substring(0, clazz.getSimpleName().length() - type.getSimpleName().length()).toLowerCase();
+                                                            } else {
+                                                                throw new IllegalStateException("No such extension name for the class " + clazz.getName() + " in the config " + url);
+                                                            }
+                                                        }
+                                                    }
+                                                    String[] names = NAME_SEPARATOR.split(name);
+                                                    if (names != null && names.length > 0) {
+                                                        Activate activate = clazz.getAnnotation(Activate.class);
+                                                        if (activate != null) {
+                                                            cachedActivates.put(names[0], activate);
+                                                        }
+                                                        for (String n : names) {
+                                                            if (! cachedNames.containsKey(clazz)) {
+                                                                cachedNames.put(clazz, n);
+                                                            }
+                                                            Class<?> c = extensionClasses.get(n);
+                                                            if (c == null) {
+                                                                extensionClasses.put(n, clazz);
+                                                            } else if (c != clazz) {
+                                                                throw new IllegalStateException("Duplicate extension " + type.getName() + " name " + n + " on " + c.getName() + " and " + clazz.getName());
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } catch (Throwable t) {
+                                        IllegalStateException e = new IllegalStateException("Failed to load extension class(interface: " + type + ", class line: " + line + ") in " + url + ", cause: " + t.getMessage(), t);
+                                        exceptions.put(line, e);
+                                    }
+                                }
+                            } // end of while read lines
+                        } finally {
+                            reader.close();
+                        }
+                    } catch (Throwable t) {
+                        logger.error("Exception when load extension class(interface: " +
+                                type + ", class file: " + url + ") in " + url, t);
+                    }
+                } // end of while urls
+            }
+        } catch (Throwable t) {
+            logger.error("Exception when load extension class(interface: " +
+                    type + ", description file: " + fileName + ").", t);
+        }
+    }
+
+    private String findAnnotationName(Class<?> clazz) {
+        com.jd.dubbo.common.Extension extension = clazz.getAnnotation(com.jd.dubbo.common.Extension.class);
+        if (extension == null) {
+            String name = clazz.getSimpleName();
+            if (name.endsWith(type.getSimpleName())) {
+                name = name.substring(0, name.length() - type.getSimpleName().length());
+            }
+            return name.toLowerCase();
+        }
+        return extension.value();
+    }
+
+    private T createAdaptiveExtension() {
+        try{
+            return injectExtension(getAdaptiveExtensionClass().newInstance());
+        } catch (Exception e) {
+            throw new
+        }
+    }
 
 
 
