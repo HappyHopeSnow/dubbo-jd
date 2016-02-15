@@ -17,6 +17,7 @@
         <module>dubbo-common</module>
         <module>dubbo</module>
         <module>dubbo-admin</module>
+        <module>dubbo-config</module>
     </modules>
 
     <profiles>

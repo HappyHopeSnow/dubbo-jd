@@ -7,4 +7,6 @@ package com.jd.dubbo.common;
  * @date 2016/1/21 11:26
  */
 public interface Resetable {
+
+    void resert(URL url);
 }
